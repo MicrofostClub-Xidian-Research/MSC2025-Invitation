@@ -33,11 +33,29 @@ class GaussianKernelEncoder(nn.Module):
         self.bandwidth = bandwidth
         
         # 随机初始化高斯核的中心点
-        # 在输入空间[-1, 1]^2中均匀分布
-        self.register_buffer(
-            'centers', 
-            torch.rand(n_kernels, input_dims) * 2 - 1  # 范围 [-1, 1]
-        )
+        # 可选择不同的初始化策略
+        init_strategy = "grid"  # 可选: "uniform", "normal", "grid", "learnable"
+        
+        if init_strategy == "uniform":
+            # 原始方法：均匀分布在[-1, 1]^2中
+            centers = torch.rand(n_kernels, input_dims) * 2 - 1
+        elif init_strategy == "normal":
+            # 正态分布，集中在中心区域
+            centers = torch.randn(n_kernels, input_dims) * 0.5
+        elif init_strategy == "grid":
+            # 网格分布，更规律
+            grid_size = int(np.sqrt(n_kernels))
+            x = torch.linspace(-1, 1, grid_size)
+            y = torch.linspace(-1, 1, grid_size)
+            grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
+            centers = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)[:n_kernels]
+        
+        if init_strategy == "learnable":
+            # 可学习的中心点
+            self.centers = nn.Parameter(centers)
+        else:
+            # 固定的中心点
+            self.register_buffer('centers', centers)
         
         # 输出维度等于高斯核的数量
         self.output_dims = n_kernels

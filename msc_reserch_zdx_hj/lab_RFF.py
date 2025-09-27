@@ -18,8 +18,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ★★★ 新增：随机傅里叶特征参数 ★★★
 # RFF的特征数量和频率标准差
-N_RFF_FEATURES = 128  # 随机傅里叶特征的数量（建议为偶数）
-RFF_GAMMA = 1.0       # 控制频率分布的参数，类似于高斯核的带宽
+N_RFF_FEATURES = 256  # 增加特征数量
+RFF_GAMMA = 10.0      # 增加频率参数，捕获更多高频细节
 
 print(f"Using device: {DEVICE}")
 
@@ -37,18 +37,25 @@ class RandomFourierFeatureEncoder(nn.Module):
             n_features += 1
             self.n_features = n_features
         
-        # 随机采样频率权重 W ~ N(0, gamma^2 * I)
-        # W shape: [input_dims, n_features//2]
-        self.register_buffer(
-            'W', 
-            torch.randn(input_dims, n_features // 2) * gamma
-        )
+        # 改进的频率采样策略
+        # 使用多尺度频率：低频 + 中频 + 高频
+        n_half = n_features // 2
+        n_low = n_half // 3      # 低频
+        n_mid = n_half // 3      # 中频  
+        n_high = n_half - n_low - n_mid  # 高频
         
-        # 随机采样相位偏移 b ~ Uniform[0, 2π]
-        # b shape: [n_features//2]
+        # 多尺度频率权重
+        W_low = torch.randn(input_dims, n_low) * (gamma * 0.1)    # 低频
+        W_mid = torch.randn(input_dims, n_mid) * (gamma * 0.5)    # 中频
+        W_high = torch.randn(input_dims, n_high) * gamma          # 高频
+        
+        W = torch.cat([W_low, W_mid, W_high], dim=1)
+        self.register_buffer('W', W)
+        
+        # 固定相位偏移为0，简化学习
         self.register_buffer(
             'b',
-            torch.rand(n_features // 2) * 2 * np.pi
+            torch.zeros(n_features // 2)
         )
         
         # 输出维度
@@ -60,19 +67,20 @@ class RandomFourierFeatureEncoder(nn.Module):
         # x @ W: [N, n_features//2]
         
         # 计算 x * W + b
-        # x @ self.W: [N, n_features//2]
-        # self.b: [n_features//2]
         projections = x @ self.W + self.b.unsqueeze(0)
         
-        # 计算 sqrt(2/n_features) * [cos(x*W + b), sin(x*W + b)]
-        # 这是随机傅里叶特征的标准公式
-        scale = np.sqrt(2.0 / self.n_features)
+        # 改进的特征计算
+        # 使用更平衡的缩放因子
+        scale = np.sqrt(1.0 / self.n_features)
         
         cos_features = torch.cos(projections) * scale
         sin_features = torch.sin(projections) * scale
         
         # 拼接cos和sin特征
         features = torch.cat([cos_features, sin_features], dim=1)
+        
+        # 可选：添加特征归一化以稳定训练
+        # features = features / (features.std() + 1e-8)
         
         return features
 
@@ -150,7 +158,14 @@ print(model)
 
 # --- 5. 定义损失函数和优化器 ---
 loss_fn = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+# 对于RFF，可能需要更小的学习率
+RFF_LEARNING_RATE = LEARNING_RATE * 0.5  # 降低学习率
+optimizer = torch.optim.Adam(model.parameters(), lr=RFF_LEARNING_RATE)
+
+# 添加学习率调度器
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.8, patience=500
+)
 
 # --- 6. 训练模型 ---
 print("\nStarting training...")
@@ -163,8 +178,18 @@ for epoch in range(EPOCHS):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
+    
+    # 更新学习率
     if (epoch + 1) % 100 == 0:
-        print(f"Epoch [{epoch+1}/{EPOCHS}], Loss: {loss.item():.6f}")
+        prev_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # 手动检测学习率变化
+        if current_lr != prev_lr:
+            print(f"Learning rate reduced from {prev_lr:.2e} to {current_lr:.2e}")
+        
+        print(f"Epoch [{epoch+1}/{EPOCHS}], Loss: {loss.item():.6f}, LR: {current_lr:.2e}")
 
 end_time = time.time()
 print(f"\nTraining finished in {end_time - start_time:.2f} seconds.")
